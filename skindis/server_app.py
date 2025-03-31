@@ -23,7 +23,8 @@ def server_fn(context: Context):
     print(f"Server model initialized on {device}")
 
     # Get model parameters
-    ndarrays = get_weights(model)
+    # In server_app.py
+    ndarrays = get_weights(UNet(n_channels=3, n_classes=1, bilinear=False))
     parameters = ndarrays_to_parameters(ndarrays)
 
     # Define strategy with timeout to prevent hanging
