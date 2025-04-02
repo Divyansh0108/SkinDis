@@ -1,159 +1,129 @@
-"""SkinCancer: A Flower / PyTorch app for skin lesion segmentation."""
-
+import os
 import torch
-import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+import torchvision.transforms.functional as TF
 from flwr.client import ClientApp, NumPyClient
 from flwr.common import Context
-
-# Import from our updated task.py with M4 Pro support
-from skindis.task import (
-    UNet,
-    get_weights,
-    load_data,
-    set_weights,
-    test,
-    train,
-    get_device,
-)
+from skindis.task import UNet, get_weights, load_data, set_weights, test, train
 
 
-# IoU calculation function
-def calculate_iou(pred, target, smooth=1e-6):
-    """Calculate IoU (Intersection over Union)"""
-    pred = (torch.sigmoid(pred) > 0.5).float()
-    intersection = (pred * target).sum()
-    union = pred.sum() + target.sum() - intersection
-    return (intersection + smooth) / (union + smooth)
+def generate_segmentation_masks(net, dataloader, device, output_dir, num_samples=9):
+    """Generates and saves predicted segmentation masks along with original images and ground truth."""
+    os.makedirs(output_dir, exist_ok=True)
+    net.eval()
+    batch = next(iter(dataloader))
+    images = batch["image"].to(device)
+    masks = batch["mask"]
+    images = images[:num_samples]
+    masks = masks[:num_samples]
+
+    with torch.no_grad():
+        outputs = net(images)
+        pred_masks = torch.sigmoid(outputs) > 0.5
+
+    fig, axes = plt.subplots(
+        min(num_samples, len(images)),
+        3,
+        figsize=(15, 5 * min(num_samples, len(images))),
+    )
+
+    if num_samples == 1:
+        axes = axes.reshape(1, -1)
+
+    axes[0, 0].set_title("Original Image")
+    axes[0, 1].set_title("Ground Truth Mask")
+    axes[0, 2].set_title("Predicted Mask")
+
+    for i in range(min(num_samples, len(images))):
+        img = images[i].cpu()
+        true_mask = masks[i].cpu()
+        pred_mask = pred_masks[i].cpu()
+        img = img * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + torch.tensor(
+            [0.485, 0.456, 0.406]
+        ).view(3, 1, 1)
+        img = torch.clamp(img, 0, 1)
+        axes[i, 0].imshow(img.permute(1, 2, 0))
+        axes[i, 0].axis("off")
+        axes[i, 1].imshow(true_mask.squeeze(), cmap="gray")
+        axes[i, 1].axis("off")
+        axes[i, 2].imshow(pred_mask.squeeze(), cmap="gray")
+        axes[i, 2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "segmentation_comparison.png"))
+    plt.close()
+    return fig
 
 
-# Define Flower Client and client_fn
 class FlowerClient(NumPyClient):
-    def __init__(self, net, trainloader, valloader, local_epochs):
+    """Defines the Flower client for federated learning."""
+
+    def __init__(
+        self, net, trainloader, valloader, local_epochs, log_file, train_csv, test_csv
+    ):
         self.net = net
+        self.device = torch.device(
+            "mps" if torch.backends.mps.is_available() else "cpu"
+        )
+        self.net.to(self.device)
         self.trainloader = trainloader
         self.valloader = valloader
         self.local_epochs = local_epochs
-
-        # Use Apple Silicon MPS acceleration if available
-        self.device = get_device()
-        print(f"Client initialized with device: {self.device}")
-        self.net.to(self.device)
+        self.log_file = log_file
+        self.train_csv = train_csv
+        self.test_csv = test_csv
 
     def fit(self, parameters, config):
-        print(f"Starting client training with {self.local_epochs} epochs")
+        """Trains the model locally and returns updated weights."""
         set_weights(self.net, parameters)
-
-        try:
-            train_loss = train(
-                self.net,
-                self.trainloader,
-                self.local_epochs,
-                self.device,
-            )
-
-            # Calculate IoU on training data
-            train_iou = self._compute_iou(self.trainloader)
-
-            print(
-                f"Client training completed with loss: {train_loss:.4f}, IoU: {train_iou:.4f}"
-            )
-            return (
-                get_weights(self.net),
-                len(self.trainloader.dataset),
-                {"train_loss": train_loss, "train_iou": train_iou},
-            )
-        except Exception as e:
-            print(f"Error during client training: {e}")
-            import traceback
-
-            traceback.print_exc()
-            # Return original weights if training fails
-            return (
-                parameters,
-                0,
-                {"train_loss": float("inf"), "train_iou": 0.0},
-            )
-
-    def _compute_iou(self, dataloader):
-        """Compute IoU on a dataloader"""
-        self.net.eval()
-        total_iou = 0.0
-        count = 0
-
-        with torch.no_grad():
-            for batch in dataloader:
-                images = batch["image"].to(self.device)
-                masks = batch["mask"].to(self.device)
-
-                outputs = self.net(images)
-                iou = calculate_iou(outputs, masks)
-                total_iou += iou.item()
-                count += 1
-
-                # Free memory
-                del images, masks, outputs
-                if self.device.type == "mps":
-                    torch.mps.empty_cache()
-                elif self.device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-        return total_iou / count if count > 0 else 0.0
+        train_loss = train(
+            self.net,
+            self.trainloader,
+            self.local_epochs,
+            self.device,
+            self.log_file,
+            self.train_csv,
+        )
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        masks_dir = os.path.join(script_dir, "predicted_masks", "training")
+        generate_segmentation_masks(self.net, self.trainloader, self.device, masks_dir)
+        return (
+            get_weights(self.net),
+            len(self.trainloader.dataset),
+            {"train_loss": float(train_loss)},
+        )
 
     def evaluate(self, parameters, config):
-        print("Starting client evaluation")
+        """Evaluates the model locally and returns metrics."""
         set_weights(self.net, parameters)
-
-        try:
-            # Get loss and dice_score from test function
-            loss, dice_score = test(self.net, self.valloader, self.device)
-
-            # Calculate IoU separately since it's not part of the original test function
-            test_iou = self._compute_iou(self.valloader)
-
-            print(
-                f"Client evaluation completed. Loss: {loss:.4f}, Dice: {dice_score:.4f}, IoU: {test_iou:.4f}"
-            )
-            return (
-                loss,
-                len(self.valloader.dataset),
-                {"dice_score": dice_score, "iou_score": test_iou},
-            )
-        except Exception as e:
-            print(f"Error during client evaluation: {e}")
-            import traceback
-
-            traceback.print_exc()
-            # Return default values if evaluation fails
-            return float("inf"), 0, {"dice_score": 0.0, "iou_score": 0.0}
+        loss, dice = test(
+            self.net, self.valloader, self.device, self.log_file, self.test_csv
+        )
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        masks_dir = os.path.join(script_dir, "predicted_masks", "evaluation")
+        generate_segmentation_masks(self.net, self.valloader, self.device, masks_dir)
+        return (
+            float(loss),
+            len(self.valloader.dataset),
+            {"dice": float(dice)},
+        )
 
 
 def client_fn(context: Context):
-    print("Initializing Flower client")
-
-    # Load UNet model with additional parameters to improve performance
-    net = UNet(
-        n_channels=3, n_classes=1, bilinear=False
-    )  # Use transposed conv instead of bilinear
-
-    # Get partition info
+    """Creates and returns a Flower client instance."""
+    net = UNet(in_channels=3, out_channels=1)
     partition_id = context.node_config["partition-id"]
     num_partitions = context.node_config["num-partitions"]
-    print(f"Client partition ID: {partition_id} of {num_partitions}")
-
-    # Load data
     trainloader, valloader = load_data(partition_id, num_partitions)
+    local_epochs = context.run_config["local-epochs"]
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_file = os.path.join(script_dir, "metrics.log")
+    train_csv = os.path.join(script_dir, "training_metrics.csv")
+    test_csv = os.path.join(script_dir, "testing_metrics.csv")
+    return FlowerClient(
+        net, trainloader, valloader, local_epochs, log_file, train_csv, test_csv
+    ).to_client()
 
-    # Get number of local epochs
-    local_epochs = context.run_config.get(
-        "local-epochs", 1
-    )  # Default to 1 if not specified
-    print(f"Client will train for {local_epochs} local epochs")
 
-    # Return Client instance
-    return FlowerClient(net, trainloader, valloader, local_epochs).to_client()
-
-
-# Flower ClientApp
-app = ClientApp(
-    client_fn,
-)
+app = ClientApp(client_fn)

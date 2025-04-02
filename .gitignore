@@ -21,6 +21,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+/mlruns
+/fl_tensorboard_logs
 parts/
 sdist/
 var/
@@ -29,6 +31,7 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+runs/
 MANIFEST
 
 # PyInstaller
@@ -36,6 +39,7 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+wandb/
 
 # Installer logs
 pip-log.txt

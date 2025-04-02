@@ -1,22 +1,76 @@
-#!/usr/bin/env python3
-"""SkinCancer: A Flower / PyTorch app for UNet segmentation on HAM10000 dataset."""
+"""fedapp: A Flower / PyTorch app."""
 
 import os
-from collections import OrderedDict
 import pandas as pd
-import numpy as np
-from PIL import Image
-import time
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torchvision import transforms
+from torchvision.transforms import Compose
+from PIL import Image
+from collections import OrderedDict
+import time
+import matplotlib.pyplot as plt
 
 
-# Custom Dataset for HAM10000
-class HAM10000Dataset(Dataset):
+def log_metrics(log_file, message):
+    """Logs a message to a specified log file."""
+    with open(log_file, "a") as f:
+        f.write(message + "\n")
+
+
+def log_metrics_to_csv(csv_file, counter, metrics):
+    """Logs metrics to a CSV file with a counter as the x-axis."""
+    if not os.path.exists(csv_file):
+        with open(csv_file, "w") as f:
+            f.write("Counter,Loss,Accuracy,IoU,DiceCoeff,DiceLoss\n")
+    with open(csv_file, "a") as f:
+        f.write(
+            f"{counter},{metrics['loss']:.4f},{metrics['accuracy']:.4f},{metrics['iou']:.4f},{metrics['dice_coeff']:.4f},{metrics['dice_loss']:.4f}\n"
+        )
+
+
+def plot_metrics(csv_file, output_folder, title_prefix):
+    """Generates line graphs for metrics from a CSV file."""
+    data = pd.read_csv(csv_file)
+    metrics = ["Loss", "Accuracy", "IoU", "DiceCoeff", "DiceLoss"]
+    os.makedirs(output_folder, exist_ok=True)
+    for metric in metrics:
+        plt.figure()
+        plt.plot(data.index, data[metric], marker="o", label=metric)
+        plt.xlabel("Data Points")
+        plt.ylabel(metric)
+        plt.title(f"{title_prefix} {metric}")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(output_folder, f"{metric.lower()}.png"))
+        plt.close()
+
+
+def dice_loss(pred, target):
+    """Computes the Dice loss for segmentation tasks."""
+    smooth = 1e-6
+    pred = torch.sigmoid(pred)
+    intersection = (pred * target).sum()
+    dice = (2.0 * intersection) / (pred.sum() + target.sum() + smooth)
+    return 1 - dice
+
+
+def calculate_metrics(pred, target):
+    """Calculates accuracy, IoU, and Dice coefficient for predictions."""
+    pred = (torch.sigmoid(pred) > 0.5).float()
+    intersection = (pred * target).sum()
+    union = pred.sum() + target.sum() - intersection
+    smooth = 1e-6
+    accuracy = (pred == target).float().mean().item()
+    iou = (intersection / (union + smooth)).item()
+    dice_coeff = (2.0 * intersection / (pred.sum() + target.sum() + smooth)).item()
+    return accuracy, iou, dice_coeff
+
+
+class LocalDataset(torch.utils.data.Dataset):
+    """Custom dataset class for loading images and corresponding masks."""
+
     def __init__(
         self,
         images_dir,
@@ -28,258 +82,131 @@ class HAM10000Dataset(Dataset):
         self.images_dir = images_dir
         self.masks_dir = masks_dir
         self.ground_truth_df = ground_truth_df
-        self.transform = transform
-        self.mask_transform = mask_transform
-
-        # Get list of image filenames
+        self.transform = transform or transforms.Compose([transforms.ToTensor()])
+        self.mask_transform = mask_transform or transforms.Compose(
+            [transforms.ToTensor()]
+        )
         self.image_filenames = [f for f in os.listdir(images_dir) if f.endswith(".jpg")]
-        print(f"Found {len(self.image_filenames)} images in {images_dir}")
 
     def __len__(self):
+        """Returns the total number of samples in the dataset."""
         return len(self.image_filenames)
 
     def __getitem__(self, idx):
-        # Get image filename
+        """Fetches an image and its corresponding mask by index."""
         img_filename = self.image_filenames[idx]
         img_path = os.path.join(self.images_dir, img_filename)
-
-        # Extract image ID to find corresponding mask
-        img_id = img_filename.split(".")[0]  # Remove extension
+        img_id = img_filename.split(".")[0]
         mask_filename = f"{img_id}_segmentation.png"
         mask_path = os.path.join(self.masks_dir, mask_filename)
-
-        # Load image and mask
-        try:
-            image = Image.open(img_path).convert("RGB")
-            mask = Image.open(mask_path).convert("L")  # Convert to grayscale
-        except Exception as e:
-            print(f"Error loading image {img_path} or mask {mask_path}: {e}")
-            # Return a placeholder if image loading fails
-            image = Image.new("RGB", (224, 224), color="black")
-            mask = Image.new("L", (224, 224), color=0)
-
-        # Apply transformations
-        if self.transform:
-            image = self.transform(image)
-        else:
-            image = transforms.ToTensor()(image)
-
-        if self.mask_transform:
-            mask = self.mask_transform(mask)
-        else:
-            mask = transforms.ToTensor()(mask)
-
-        return {"image": image, "mask": mask, "image_id": img_id}
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        image = self.transform(image)
+        mask = self.mask_transform(mask)
+        return {"image": image, "mask": mask}
 
 
-# UNet Model Components
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.double_conv = nn.Sequential(
+class UNet(nn.Module):
+    """UNet model implementation for image segmentation tasks."""
+
+    def __init__(self, in_channels=3, out_channels=1, dropout=0.1):
+        super(UNet, self).__init__()
+        self.encoder1 = self._block(in_channels, 32, dropout)
+        self.encoder2 = self._block(32, 64, dropout)
+        self.encoder3 = self._block(64, 128, dropout)
+        self.encoder4 = self._block(128, 256, dropout)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.bottleneck = self._block(256, 512, dropout)
+        self.upconv1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.decoder1 = self._block(512, 256, dropout)
+        self.upconv2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.decoder2 = self._block(256, 128, dropout)
+        self.upconv3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.decoder3 = self._block(128, 64, dropout)
+        self.upconv4 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.decoder4 = self._block(64, 32, dropout)
+        self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1)
+
+    def _block(self, in_channels, out_channels, dropout):
+        """Creates a convolutional block with batch normalization and dropout."""
+        return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
-        return self.double_conv(x)
+        """Defines the forward pass of the UNet model."""
+        enc1 = self.encoder1(x)
+        enc2 = self.encoder2(self.pool(enc1))
+        enc3 = self.encoder3(self.pool(enc2))
+        enc4 = self.encoder4(self.pool(enc3))
+        bottleneck = self.bottleneck(self.pool(enc4))
+        dec1 = self.upconv1(bottleneck)
+        dec1 = torch.cat((dec1, enc4), dim=1)
+        dec1 = self.decoder1(dec1)
+        dec2 = self.upconv2(dec1)
+        dec2 = torch.cat((dec2, enc3), dim=1)
+        dec2 = self.decoder2(dec2)
+        dec3 = self.upconv3(dec2)
+        dec3 = torch.cat((dec3, enc2), dim=1)
+        dec3 = self.decoder3(dec3)
+        dec4 = self.upconv4(dec3)
+        dec4 = torch.cat((dec4, enc1), dim=1)
+        dec4 = self.decoder4(dec4)
+        return self.final_conv(dec4)
 
 
-class Down(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2), DoubleConv(in_channels, out_channels)
-        )
-
-    def forward(self, x):
-        return self.maxpool_conv(x)
-
-
-class Up(nn.Module):
-    def __init__(self, in_channels, out_channels, bilinear=True):
-        super().__init__()
-        if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels)
-        else:
-            self.up = nn.ConvTranspose2d(
-                in_channels, in_channels // 2, kernel_size=2, stride=2
-            )
-            self.conv = DoubleConv(in_channels, out_channels)
-
-    def forward(self, x1, x2):
-        x1 = self.up(x1)
-        # Padding if needed
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
-        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
-
-
-class OutConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class UNet(nn.Module):
-    def __init__(self, n_channels=3, n_classes=1, bilinear=True):
-        super(UNet, self).__init__()
-        self.n_channels = n_channels
-        self.n_classes = n_classes
-        self.bilinear = bilinear
-
-        # Reduce feature map sizes to save memory on Apple Silicon
-        base_features = 32  # Reduced from 64
-
-        self.inc = DoubleConv(n_channels, base_features)
-        self.down1 = Down(base_features, base_features * 2)
-        self.down2 = Down(base_features * 2, base_features * 4)
-        self.down3 = Down(base_features * 4, base_features * 8)
-        factor = 2 if bilinear else 1
-        self.down4 = Down(base_features * 8, base_features * 16 // factor)
-        self.up1 = Up(base_features * 16, base_features * 8 // factor, bilinear)
-        self.up2 = Up(base_features * 8, base_features * 4 // factor, bilinear)
-        self.up3 = Up(base_features * 4, base_features * 2 // factor, bilinear)
-        self.up4 = Up(base_features * 2, base_features, bilinear)
-        self.outc = OutConv(base_features, n_classes)
-
-    def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
-        return logits
-
-
-# Dice loss for better segmentation results
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1.0):
-        super(DiceLoss, self).__init__()
-        self.smooth = smooth
-
-    def forward(self, pred, target):
-        pred = torch.sigmoid(pred)
-
-        # Flatten
-        pred_flat = pred.view(-1)
-        target_flat = target.view(-1)
-
-        # Calculate Dice coefficient
-        intersection = (pred_flat * target_flat).sum()
-        dice = (2.0 * intersection + self.smooth) / (
-            pred_flat.sum() + target_flat.sum() + self.smooth
-        )
-
-        return 1 - dice
-
-
-# Get the appropriate device for Mac M4 Pro
-def get_device():
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using MPS (Apple Silicon GPU)")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("Using CUDA GPU")
-    else:
-        device = torch.device("cpu")
-        print("Using CPU")
-    return device
-
-
-# Function to load data
 def load_data(partition_id: int, num_partitions: int):
-    """Load partitioned HAM10000 data for federated learning."""
-    # Define paths - use absolute path
+    """Loads the dataset and creates train/test data loaders for a specific partition."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(script_dir, "data")
     images_dir = os.path.join(data_dir, "images")
     masks_dir = os.path.join(data_dir, "masks")
     ground_truth_path = os.path.join(data_dir, "GroundTruth.csv")
 
-    print(f"Loading data from: {data_dir}")
-    print(f"Partition ID: {partition_id}, Total partitions: {num_partitions}")
-
-    # Try to load ground truth
     try:
         ground_truth_df = pd.read_csv(ground_truth_path)
-        print(f"Ground truth loaded with {len(ground_truth_df)} rows")
     except FileNotFoundError:
-        print(
-            f"Ground truth file not found at {ground_truth_path}. Continuing without it."
-        )
         ground_truth_df = None
 
-    # Check if data directories exist
     if not os.path.exists(images_dir):
         raise FileNotFoundError(f"Images directory not found at {images_dir}")
     if not os.path.exists(masks_dir):
         raise FileNotFoundError(f"Masks directory not found at {masks_dir}")
 
-    # Define transforms
-    img_transform = transforms.Compose(
+    img_transform = Compose(
         [
-            transforms.Resize((160, 160)),  # Reduce image size for M4 Pro
+            transforms.Resize((128, 128)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
+    mask_transform = Compose([transforms.Resize((128, 128)), transforms.ToTensor()])
 
-    mask_transform = transforms.Compose(
-        [transforms.Resize((160, 160)), transforms.ToTensor()]  # Matching image size
+    full_dataset = LocalDataset(
+        images_dir,
+        masks_dir,
+        ground_truth_df,
+        transform=img_transform,
+        mask_transform=mask_transform,
     )
 
-    # Create full dataset
-    try:
-        full_dataset = HAM10000Dataset(
-            images_dir,
-            masks_dir,
-            ground_truth_df,
-            transform=img_transform,
-            mask_transform=mask_transform,
-        )
-        print(f"Dataset created with {len(full_dataset)} samples")
-    except Exception as e:
-        raise RuntimeError(f"Error creating dataset: {str(e)}")
-
-    # Divide dataset into partitions for federated learning
     n_samples = len(full_dataset)
     samples_per_partition = n_samples // num_partitions
     partition_lengths = [samples_per_partition] * (num_partitions - 1)
-    partition_lengths.append(
-        n_samples - sum(partition_lengths)
-    )  # Ensure all samples used
+    partition_lengths.append(n_samples - sum(partition_lengths))
 
-    print(
-        f"Creating {num_partitions} partitions with {samples_per_partition} samples each"
-    )
-
-    # Split dataset into partitions
     partitioned_datasets = torch.utils.data.random_split(
         full_dataset, partition_lengths, generator=torch.Generator().manual_seed(42)
     )
 
-    # Get current partition
     current_partition = partitioned_datasets[partition_id]
-    print(f"Partition {partition_id} has {len(current_partition)} samples")
 
-    # Split partition into train/test sets
     train_size = int(0.8 * len(current_partition))
     test_size = len(current_partition) - train_size
     train_dataset, test_dataset = torch.utils.data.random_split(
@@ -288,228 +215,187 @@ def load_data(partition_id: int, num_partitions: int):
         generator=torch.Generator().manual_seed(42),
     )
 
-    # Create data loaders with smaller batch size for M4 Pro
-    trainloader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=2)
-    testloader = DataLoader(test_dataset, batch_size=4, num_workers=2)
+    trainloader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=2)
+    testloader = DataLoader(test_dataset, batch_size=16, num_workers=2)
 
-    print(
-        f"Created train loader with {len(train_dataset)} samples and test loader with {len(test_dataset)} samples"
-    )
     return trainloader, testloader
 
 
-def train(net, trainloader, epochs, device):
-    """Train the UNet model on the training set."""
-    print(f"Training for {epochs} epochs on {device}")
+def train(net, trainloader, epochs, device, log_file, csv_file):
+    """Trains the model using the training dataset."""
     net.to(device)
-    criterion = nn.BCEWithLogitsLoss()
-    dice_criterion = DiceLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.0005)  # Reduced learning rate
-
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    criterion = torch.nn.BCEWithLogitsLoss().to(device)
+    optimizer = torch.optim.Adam(net.parameters(), lr=0.0005)
     net.train()
-    running_loss = 0.0
-    batch_count = 0
 
+    counter = 0
     for epoch in range(epochs):
-        epoch_start = time.time()
-        epoch_loss = 0.0
-        batch_count_epoch = 0
-
-        for batch_idx, batch in enumerate(trainloader):
-            try:
-                images = batch["image"].to(device)
-                masks = batch["mask"].to(device)
-
-                # Clear gradients
-                optimizer.zero_grad()
-
-                # Forward pass
-                outputs = net(images)
-
-                # Calculate loss
-                bce_loss = criterion(outputs, masks)
-                dice_loss = dice_criterion(outputs, masks)
-                loss = bce_loss + dice_loss
-
-                # Backward pass
-                loss.backward()
-
-                # Update weights
-                optimizer.step()
-
-                # Update statistics
-                epoch_loss += loss.item()
-                batch_count_epoch += 1
-
-                # Print progress every 10 batches
-                if (batch_idx + 1) % 10 == 0:
-                    print(
-                        f"  Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}/{len(trainloader)}, Loss: {loss.item():.4f}"
-                    )
-
-                # Explicitly clear variables to free memory
-                del images, masks, outputs, loss
-                if device.type == "mps":
-                    # Special handling for MPS
-                    torch.mps.empty_cache()
-                elif device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-            except Exception as e:
-                print(f"Error in batch {batch_idx}: {e}")
-                continue
-
-        # End of epoch
-        epoch_time = time.time() - epoch_start
-        print(
-            f"Epoch {epoch+1}/{epochs} completed in {epoch_time:.2f}s, Avg Loss: {epoch_loss/batch_count_epoch:.4f}"
+        (
+            running_loss,
+            running_accuracy,
+            running_iou,
+            running_dice_coeff,
+            running_dice_loss,
+        ) = (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         )
-        running_loss += epoch_loss
-        batch_count += batch_count_epoch
+        for batch_idx, batch in enumerate(trainloader):
+            images = batch["image"].to(device)
+            masks = batch["mask"].to(device)
 
-    if batch_count > 0:
-        avg_trainloss = running_loss / batch_count
-    else:
-        avg_trainloss = 0
-    print(f"Training completed. Average loss: {avg_trainloss:.4f}")
-    return avg_trainloss
+            optimizer.zero_grad()
+            outputs = net(images)
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
+
+            accuracy, iou, dice_coeff = calculate_metrics(outputs, masks)
+            dice_loss_value = dice_loss(outputs, masks).item()
+
+            running_loss += loss.item()
+            running_accuracy += accuracy
+            running_iou += iou
+            running_dice_coeff += dice_coeff
+            running_dice_loss += dice_loss_value
+
+        avg_loss = running_loss / len(trainloader)
+        avg_accuracy = running_accuracy / len(trainloader)
+        avg_iou = running_iou / len(trainloader)
+        avg_dice_coeff = running_dice_coeff / len(trainloader)
+        avg_dice_loss = running_dice_loss / len(trainloader)
+
+        log_metrics(
+            log_file,
+            f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}, IoU: {avg_iou:.4f}, Dice Coeff: {avg_dice_coeff:.4f}, Dice Loss: {avg_dice_loss:.4f}",
+        )
+        log_metrics_to_csv(
+            csv_file,
+            counter,
+            {
+                "loss": avg_loss,
+                "accuracy": avg_accuracy,
+                "iou": avg_iou,
+                "dice_coeff": avg_dice_coeff,
+                "dice_loss": avg_dice_loss,
+            },
+        )
+        counter += 1
+
+    return avg_loss
 
 
-def test(net, testloader, device):
-    """Validate the UNet model on the test set."""
-    print(f"Testing on {device}")
+def test(net, testloader, device, log_file, csv_file):
+    """Validates the model using the test dataset."""
     net.to(device)
-    criterion = nn.BCEWithLogitsLoss()
-    dice_criterion = DiceLoss()
-
-    val_loss = 0.0
-    dice_score = 0.0
-    batch_count = 0
-
+    criterion = torch.nn.BCEWithLogitsLoss()
     net.eval()
+    total_loss, total_accuracy, total_iou, total_dice_coeff, total_dice_loss = (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    )
+
+    counter = 0
     with torch.no_grad():
         for batch_idx, batch in enumerate(testloader):
-            try:
-                images = batch["image"].to(device)
-                masks = batch["mask"].to(device)
+            images = batch["image"].to(device)
+            masks = batch["mask"].to(device)
+            outputs = net(images)
 
-                outputs = net(images)
+            loss = criterion(outputs, masks).item()
+            dice_loss_value = dice_loss(outputs, masks).item()
 
-                # Calculate losses
-                bce_loss = criterion(outputs, masks)
-                dice_loss = dice_criterion(outputs, masks)
-                loss = bce_loss + dice_loss
+            accuracy, iou, dice_coeff = calculate_metrics(outputs, masks)
 
-                val_loss += loss.item()
+            total_loss += loss
+            total_dice_loss += dice_loss_value
+            total_accuracy += accuracy
+            total_iou += iou
+            total_dice_coeff += dice_coeff
 
-                # Calculate Dice coefficient (F1 score)
-                pred = torch.sigmoid(outputs) > 0.5
-                pred = pred.float()
-                intersection = (pred * masks).sum()
-                dice = (2.0 * intersection) / (pred.sum() + masks.sum() + 1e-8)
-                dice_score += dice.item()
+    avg_loss = total_loss / len(testloader)
+    avg_dice_loss = total_dice_loss / len(testloader)
+    avg_accuracy = total_accuracy / len(testloader)
+    avg_iou = total_iou / len(testloader)
+    avg_dice_coeff = total_dice_coeff / len(testloader)
 
-                batch_count += 1
-
-                # Print progress
-                if (batch_idx + 1) % 5 == 0:
-                    print(f"  Testing batch {batch_idx+1}/{len(testloader)}")
-
-                # Explicitly clear variables to free memory
-                del images, masks, outputs, pred
-                if device.type == "mps":
-                    torch.mps.empty_cache()
-                elif device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-            except Exception as e:
-                print(f"Error in test batch {batch_idx}: {e}")
-                continue
-
-    if batch_count > 0:
-        avg_val_loss = val_loss / batch_count
-        avg_dice = dice_score / batch_count
-    else:
-        avg_val_loss = 0
-        avg_dice = 0
-
-    print(
-        f"Testing completed. Validation loss: {avg_val_loss:.4f}, Dice score: {avg_dice:.4f}"
+    log_metrics(
+        log_file,
+        f"Testing - Loss: {avg_loss:.4f}, Dice Loss: {avg_dice_loss:.4f}, Accuracy: {avg_accuracy:.4f}, IoU: {avg_iou:.4f}, Dice Coeff: {avg_dice_coeff:.4f}",
     )
-    return avg_val_loss, avg_dice
+
+    log_metrics_to_csv(
+        csv_file,
+        counter,
+        {
+            "loss": avg_loss,
+            "accuracy": avg_accuracy,
+            "iou": avg_iou,
+            "dice_coeff": avg_dice_coeff,
+            "dice_loss": avg_dice_loss,
+        },
+    )
+    counter += 1
+
+    return avg_loss, avg_dice_coeff
 
 
 def get_weights(net):
-    """Get model weights as a list of NumPy arrays."""
+    """Extracts model weights as a list of NumPy arrays."""
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
 
 def set_weights(net, parameters):
-    """Set model weights from a list of NumPy arrays."""
+    """Sets model weights from a list of NumPy arrays."""
     params_dict = zip(net.state_dict().keys(), parameters)
     state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-    net.load_state_dict(state_dict, strict=True)
-
-
-def save_model(net, path):
-    """Save model to disk."""
-    torch.save(net.state_dict(), path)
-    print(f"Model saved to {path}")
-
-
-def load_model(path, model=None):
-    """Load model from disk."""
-    if model is None:
-        model = UNet(n_channels=3, n_classes=1)
-    model.load_state_dict(torch.load(path))
-    return model
-
-
-# Main function to test everything works locally before federated learning
-def main():
-    # Select device
-    device = get_device()
-
-    # Create UNet model (with reduced size)
-    model = UNet(n_channels=3, n_classes=1)
-    print(f"Model created: {model.__class__.__name__}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
-
-    # Load data for a single partition (for testing)
     try:
-        trainloader, testloader = load_data(partition_id=0, num_partitions=5)
-        print(f"Data loaded successfully")
-    except Exception as e:
-        print(f"Error loading data: {e}")
-        return
-
-    # Train the model
-    try:
-        train_loss = train(model, trainloader, epochs=1, device=device)
-        print(f"Training completed. Final loss: {train_loss:.4f}")
-    except Exception as e:
-        print(f"Error during training: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return
-
-    # Test the model
-    try:
-        val_loss, dice_score = test(model, testloader, device)
-        print(
-            f"Testing completed. Validation loss: {val_loss:.4f}, Dice score: {dice_score:.4f}"
-        )
-    except Exception as e:
-        print(f"Error during testing: {e}")
-        return
-
-    # Save the model
-    try:
-        save_model(model, "unet_ham10000.pth")
-    except Exception as e:
-        print(f"Error saving model: {e}")
+        net.load_state_dict(state_dict, strict=True)
+    except RuntimeError as e:
+        net.load_state_dict(state_dict, strict=False)
 
 
 if __name__ == "__main__":
-    main()
+    """Main script for initializing and running the training/testing pipeline."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(script_dir, "data")
+    images_dir = os.path.join(data_dir, "images")
+    masks_dir = os.path.join(data_dir, "masks")
+    log_file = os.path.join(script_dir, "metrics.log")
+    train_csv = os.path.join(script_dir, "training_metrics.csv")
+    test_csv = os.path.join(script_dir, "testing_metrics.csv")
+    train_graph_folder = os.path.join(script_dir, "training_graphs")
+    test_graph_folder = os.path.join(script_dir, "testing_graphs")
+
+    with open(log_file, "w") as f:
+        f.write("Metrics Log\n")
+    with open(train_csv, "w") as f:
+        f.write("Counter,Loss,Accuracy,IoU,DiceCoeff,DiceLoss\n")
+    with open(test_csv, "w") as f:
+        f.write("Counter,Loss,Accuracy,IoU,DiceCoeff,DiceLoss\n")
+
+    img_transform = Compose(
+        [
+            transforms.Resize((128, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    mask_transform = Compose([transforms.Resize((128, 128)), transforms.ToTensor()])
+
+    dataset = LocalDataset(
+        images_dir=images_dir,
+        masks_dir=masks_dir,
+        transform=img_transform,
+        mask_transform=mask_transform,
+    )
+
+    plot_metrics(train_csv, train_graph_folder, "Training")
+    plot_metrics(test_csv, test_graph_folder, "Testing")
